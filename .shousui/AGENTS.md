@@ -1,0 +1,3 @@
+- `/.shousui` 下用于存放一些 Agent 自动生成的文档
+  - `/.shousui/notes` 用于存放笔记结论
+  - `/.shousui/discuss` 用于存放非结论的过程中文件，包括讨论内容。
