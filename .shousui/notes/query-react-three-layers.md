@@ -17,66 +17,67 @@
 | 章 | 问的问题 | 在循环里的位置 |
 |----|----------|----------------|
 | **Layer 0** | 模型怎么推理、要不要调 tool？ | `llm ⇄ tools` |
-| **Layer 1** | 上下文塞不进 / API 报错怎么修 messages？ | **prep**（调 API 前）+ **finish**（无 tool 时调 API 后） |
-| **Layer 2** | 运行时谁执行 tool、塞什么附件、何时算完？ | **attachments**、hooks、budget、abort、`query()` wrapper |
+| **Layer 1** | 上下文塞不进 / API 报错怎么修 messages？ | **1-1 prep** + **1-2 finish** |
+| **Layer 2** | 运行时谁执行 tool、塞什么附件、何时算完？ | **2-1** tools → **2-2** attachments → **2-3** hooks → **2-4** abort → **2-5** wrapper |
 
-### 总图（讲故事和画架构用同一张）
+### 图 1：三层各管什么（静态）
 
-```
-                    ┌─ 上下文壳 ─────────────────────────┐
-                    │  prep（主动）                       │
-                    │  finish / recovery（被动，无 tool） │
-                    └──────────────┬─────────────────────┘
-                                   ▼
-              ┌──────── 内核：llm ⇄ tools ────────┐
-              │                                    │
-              └──────────────┬─────────────────────┘
-                             ▼
-                    ┌─ 编排壳 ─────────────────────────┐
-                    │  post-tools: attachments           │
-                    │  turn 结束: stop_hooks, budget     │
-                    │  进程级: query() wrapper, Langfuse │
-                    │  横切: abort, StreamingToolExecutor  │
-                    └────────────────────────────────────┘
+**不是**执行顺序；顺序只看 **图 2**。
+
+| 层 | 关切 | 对应节点（图 2） |
+|----|------|------------------|
+| **Layer 1** 上下文壳 | `messages` 能否进/出 API | `1-1 prep`、`1-2 finish` |
+| **Layer 0** 内核 | 推理与 tool 循环 | `llm`、`tools` |
+| **Layer 2** 编排壳 | 怎么执行、注入什么、何时结束 | `2-1` … `2-6`、`2-5` 外圈 |
+
+### 图 2：主循环（控制流 — 全文唯一总图）
+
+**每次 `while` iteration** 走一遍；`2-5 query()` 在环外包裹整次调用。
+
+```mermaid
+flowchart TB
+  START(["用户 prompt"]) --> WRAP["2-5 query()"]
+  WRAP --> PREP["1-1 prep"]
+  PREP --> LLM["0 · llm"]
+  LLM --> FORK{"tool_use?"}
+
+  FORK -->|否| FIN["1-2 finish"]
+  FIN -->|recovery 成功| PREP
+  FIN -->|否则| HOOKS["2-3 hooks"]
+  HOOKS -->|completed| END(["Terminal"])
+  HOOKS -->|continue| PREP
+
+  FORK -->|是| TOOLS["0 · tools"]
+  TOOLS --> ATT["2-2 attachments"]
+  ATT --> PREP
+
+  LLM -.->|2-4 abort| END
+  TOOLS -.->|2-4 abort| END
+  ATT -.->|2-6 maxTurns 超限| END
 ```
 
-**循环边**：
-
-```
-prep → llm ─┬─→ finish → hooks → END
-            │              └→ prep（recovery / hook blocking / budget）
-            └─→ tools → attachments → prep（next_turn）
-```
+| 图 2 补充 | 说明 |
+|-----------|------|
+| 任意节点 → `END` 虚线 | `2-4 abort` 可在 stream / tools 触发 |
+| `attachments` → `END` 虚线 | `2-6 maxTurns` 超限 |
+| 回 `prep` | 新一轮 iteration（`next_turn`、recovery、hook blocking、budget…） |
+| `Terminal` 之后 | `2-5 finally`：trace、autonomy，见 **图 10** |
 
 ---
 
 ## Layer 0：最普通的 ReAct
 
-### 心智模型
+### 图 3：Layer 0 内核（仅 ReAct）
 
-```
-用户消息
-   ↓
-┌──────────────────────────────────┐
-│  while True:                     │
-│    response = LLM(messages)      │
-│    if 没有 tool_use: break       │
-│    results = Tools(response)     │
-│    messages += [response, results]│
-└──────────────────────────────────┘
-   ↓
-结束
-```
-
-### LangGraph（最小图）
+不含 prep / hooks；对应 **图 2** 里的 `llm ⇄ tools` 段。
 
 ```mermaid
 flowchart LR
-  START((START)) --> llm["llm"]
-  llm --> route{tool_use?}
-  route -->|是| tools["tools"]
-  route -->|否| END((END))
-  tools --> llm
+  START((iteration 内)) --> LLM["llm"]
+  LLM --> Q{"tool_use?"}
+  Q -->|否| EXIT(["交给 1-2 finish"])
+  Q -->|是| TOOLS["tools"]
+  TOOLS --> LLM
 ```
 
 ### 伪代码
@@ -143,28 +144,33 @@ def react_loop(messages):
 
 | 段 | 时机 | 做什么 |
 |----|------|--------|
-| **1a prep（主动）** | 每次 `callModel` **之前** | snip / microcompact / autocompact… |
-| **1b finish（被动）** | `callModel` **之后**、且无 `tool_use` | withhold → recovery（413 / media / max_output） |
+| **1-1 prep（主动）** | 每次 `callModel` **之前** | snip / microcompact / autocompact… |
+| **1-2 finish（被动）** | `callModel` **之后**、且无 `tool_use` | withhold → recovery（413 / media / max_output） |
 
 ### 为什么需要上下文壳
 
 纯 ReAct 假设 `messages` 永远能塞进模型窗口。长会话会在 **调 API 前** 就爆（prep 解决），或在 **调 API 后** 才暴露（finish 解决）。两层壳里的第一层只改 messages，不改 ReAct 图。
 
-### 1a — prep（主动）
+### 1-1 — prep（主动）
 
-### 扩展后的图
+对应 **图 2** 每次进 `llm` 之前；**线性管线**，不是环。
+
+### 图 4：1-1 prep 管线
 
 ```mermaid
-flowchart LR
-  START((START)) --> prep["prep<br/>compact 管线"]
-  prep --> llm["llm"]
-  llm --> route{tool_use?}
-  route -->|是| tools["tools"]
-  route -->|否| END((END))
-  tools --> prep
+flowchart TB
+  IN(["入: state.messages"]) --> S1["取 compact 边界"]
+  S1 --> S2["释放 toolUseResult"]
+  S2 --> S3["tool 结果预算"]
+  S3 --> S4["snip"]
+  S4 --> S5["microcompact"]
+  S5 --> S6["context collapse"]
+  S6 --> S7["autocompact / 预测压缩"]
+  S7 --> OUT(["出: messagesForQuery → llm"])
+  S7 -.->|仍超限且关 auto-compact| BL(["blocking_limit · END"])
 ```
 
-### prep 里做什么（按顺序）
+### prep 步骤表（与图 4 对照）
 
 | 步骤 | 模块 | 作用 |
 |------|------|------|
@@ -204,7 +210,22 @@ flowchart LR
       }
 ```
 
-### 1b — finish（被动）：错误与恢复
+### 1-2 — finish（被动）：错误与恢复
+
+对应 **图 2**「无 tool」分支；在 `llm` 之后、`2-3 hooks` 之前。
+
+### 图 5：1-2 finish（无 tool 出口）
+
+```mermaid
+flowchart TB
+  IN(["llm 流结束<br/>needsFollowUp = false"]) --> WH{"可恢复错误?<br/>PTL / media / max_output"}
+  WH -->|否，正常结束| HOOKS(["→ 2-3 hooks"])
+  WH -->|是，先 withhold| TRY["recovery 梯<br/>collapse → reactive compact …"]
+  TRY --> OK{"成功?"}
+  OK -->|是| PREP(["→ 1-1 prep · continue"])
+  OK -->|否| ERR(["yield 错误 · Terminal"])
+  ERR -.->|禁止| X["✗ 不进 stop hooks"]
+```
 
 流式阶段对 **可恢复错误 withhold**（先不 yield 给用户），在 `!needsFollowUp` 分支里尝试恢复，失败再 `END`。
 
@@ -229,8 +250,8 @@ flowchart LR
 
 | 段 | 源码（约） |
 |----|------------|
-| **1a prep** | `522–873` |
-| **1b finish** | `1026–1062`（withhold），`1334–1528`（recovery） |
+| **1-1 prep** | `522–873` |
+| **1-2 finish** | `1026–1062`（withhold），`1334–1528`（recovery） |
 
 - 环仍是 `prep → llm → …`；finish 只在 **无 tool** 的出口上生效。
 - recovery 与 prep **同属上下文壳**，不要拆成「叙事第二章」。
@@ -241,32 +262,31 @@ flowchart LR
 
 **关切**：ReAct 内核跑起来之后，**运行时**怎么执行 tool、往对话里 **注入什么**、**何时结束** turn / 整次 `query()`。
 
-分四块（都在内核外侧，不改变 `llm ⇄ tools` 两节点）：
+分六节（都在内核外侧，不改变 `llm ⇄ tools` 两节点）：
 
-| 块 | 时机 | 做什么 |
+| 节 | 时机 | 做什么 |
 |----|------|--------|
-| **2a tools 执行** | 有 `tool_use` | 权限、并行流式执行、abort |
-| **2b attachments** | tools 之后 | 队列、memory/skill prefetch、拼回 messages |
-| **2c turn 结束** | 无 tool、recovery 完后 | stop hooks、token budget |
-| **2d 进程级** | `query()` 外圈 | Langfuse、autonomy finally |
+| **2-1** tools 执行 | 有 `tool_use` | 权限、并行流式执行 |
+| **2-2** attachments | tools 之后 | 队列、memory/skill prefetch、拼回 messages |
+| **2-3** turn 结束 | 无 tool、recovery 完后 | stop hooks、token budget |
+| **2-4** 中断 | stream / tools 两路 | abort、`aborted_*` |
+| **2-5** 进程级 | `query()` 外圈 | Langfuse、autonomy finally |
+| **2-6** 边界 | 工具路径末尾等 | `maxTurns`、`Terminal` 类型 |
 
-**横切**：`abort` 贯穿 2a 的 stream 与 tools 两路。
+### 2-1 — tools 执行（内核的「怎么跑」）
 
-### 2a — tools 执行（内核的「怎么跑」）
+对应 **图 2**「有 tool」分支里的 `tools` 节点；**不改变** `llm → tools` 拓扑，只改执行策略。
 
-有 `tool_use` 时走内核 `tools`，编排壳决定 **执行方式**（批处理 vs 流式并行）：
+### 图 6：2-1 与 Layer 0 tools 的关系
 
 ```mermaid
 flowchart LR
-  prep --> llm
-  llm -->|tool_use| tools
-  llm -->|无 tool| finish
-  tools --> attach["attachments"]
-  attach --> prep
-  finish --> hooks
-  hooks --> END((END))
-  finish -->|recovery| prep
-  hooks -->|continue| prep
+  LLM["Layer 0 · llm<br/>流出 tool_use 块"] --> MODE{"2-1 执行方式"}
+  MODE --> A["批处理 runTools"]
+  MODE --> B["流式 StreamingToolExecutor<br/>与 llm 并行"]
+  A --> RES["tool_result"]
+  B --> RES
+  RES --> NEXT(["→ 2-2 attachments"])
 ```
 
 | 步骤 | 作用 |
@@ -278,7 +298,21 @@ flowchart LR
 
 源码：约 `1635–1683`。
 
-### 2b — attachments（tool 后注入）
+### 2-2 — attachments（tool 后注入）
+
+对应 **图 2** 中 `tools` 之后、`回 prep` 之前。
+
+### 图 7：2-2 注入什么
+
+```mermaid
+flowchart TB
+  IN(["入: assistant + tool_results"]) --> A["getAttachmentMessages<br/>队列 / 文件变更"]
+  A --> B["memory prefetch"]
+  B --> C["skill / tool prefetch"]
+  C --> D["refreshTools · MCP"]
+  D --> OUT(["拼入 messages<br/>transition: next_turn"])
+  OUT --> PREP(["→ 1-1 prep"])
+```
 
 **内核**产出 `tool_result` 之后，编排壳注入 **非 tool 因果链** 的上下文：
 
@@ -306,7 +340,23 @@ flowchart LR
 
 源码：约 `1826–1985`。
 
-### 2c — turn 结束：stop hooks & token budget
+### 2-3 — turn 结束：stop hooks & token budget
+
+对应 **图 5** 正常出口 → **图 2** 的 `2-3 hooks` 节点。
+
+### 图 8：2-3 turn 如何结束
+
+```mermaid
+flowchart TB
+  IN(["1-2 无错误 / recovery 已放弃"]) --> SH["stop hooks"]
+  SH --> P{"preventContinuation?"}
+  P -->|是| E1(["Terminal · stop_hook_prevented"])
+  P -->|否| B{"blocking 错误?"}
+  B -->|是| LOOP(["→ 1-1 prep · stop_hook_blocking"])
+  B -->|否| TB{"token budget<br/>未满?"}
+  TB -->|是| LOOP2(["→ 1-1 prep · budget nudge"])
+  TB -->|否| OK(["Terminal · completed"])
+```
 
 无 `tool_use` 且 recovery 都失败后，才进入「这一轮算不算完」的产品逻辑：
 
@@ -333,18 +383,34 @@ flowchart LR
 | stop hook 注入 blocking 错误 | 当作新 user 消息 → **continue**（又一整轮 ReAct） |
 | token budget 未满 | meta nudge → **continue**（模型继续干，不算新用户 turn） |
 
-### 2d — 中断（Abort，横切）
+### 2-4 — 中断（Abort，横切）
 
-abort 不单独成架构层，贯穿 **llm 流** 与 **tools** 两路：
+在 **图 2** 上标为虚线：可在 `llm` 流中或 `tools` 后触发，直接 `Terminal`。
 
-| 时机 | Terminal |
-|------|----------|
-| stream 中 abort | `aborted_streaming` |
-| tool 执行中 abort | `aborted_tools` |
+### 图 9：2-4 两个出口（对照图 2）
+
+| 时机 | 图 2 位置 | Terminal |
+|------|-----------|----------|
+| stream 中 Ctrl+C | `llm` 之后 | `aborted_streaming` |
+| tool 执行中 Ctrl+C | `2-2` 之前 | `aborted_tools` |
 
 `StreamingToolExecutor` 会为未完成的 tool 合成 `tool_result`，避免 API 缺对。
 
-### 2e — 外层 `query()` 包装（进程级）
+### 2-5 — 外层 `query()` 包装（进程级）
+
+包住 **图 2 整圈**；`queryLoop` 返回后执行 `finally`，**不参与** iteration 环。
+
+### 图 10：2-5 与 queryLoop 的关系
+
+```mermaid
+flowchart TB
+  REPL["REPL / SDK"] --> Q["query()"]
+  Q --> T["createTrace · Langfuse"]
+  T --> LOOP["queryLoop · 图 2 主循环"]
+  LOOP --> FIN["finally<br/>autonomy · endTrace · flush"]
+  FIN --> RET["return Terminal"]
+  RET --> REPL
+```
 
 `queryLoop` 之上还有薄包装，**不参与 ReAct 环**：
 
@@ -361,7 +427,7 @@ export async function* query(params) {
 }
 ```
 
-### 2f — `maxTurns` 与 `Terminal` 全集
+### 2-6 — `maxTurns` 与 `Terminal` 全集
 
 工具路径末尾检查 `maxTurns`；各类 `Terminal` 定义在 `src/query/transitions.ts`。
 
@@ -392,11 +458,12 @@ export type Continue =
 
 | 块 | 源码（约） |
 |----|------------|
-| **2a tools** | `1635–1683` |
-| **2b attachments** | `1826–1985` |
-| **2c hooks / budget** | `1542–1630` |
-| **2d abort** | `1287–1323`，`1764–1794` |
-| **2e wrapper** | `275–390` |
+| **2-1 tools** | `1635–1683` |
+| **2-2 attachments** | `1826–1985` |
+| **2-3 hooks / budget** | `1542–1630` |
+| **2-4 abort** | `1287–1323`，`1764–1794` |
+| **2-5 wrapper** | `275–390` |
+| **2-6 maxTurns / Terminal** | `1787–1794`，`transitions.ts` |
 
 - **不改 ReAct 拓扑**；管的是执行、注入、结束规则。
 - `Continue`（含 `next_turn`）→ 回 **Layer 1 prep**；`Terminal` → 整次 `query()` 结束。
@@ -405,38 +472,22 @@ export type Continue =
 
 ## 完整故事：三章走完一次用户 turn
 
-### 总图
+> 控制流只认 **图 2**；各章细节见 **图 3–10**，勿再画第二圈环。
 
-```mermaid
-flowchart TB
-  subgraph L0["Layer 0 内核"]
-    llm["llm"]
-    tools["tools"]
-    llm -->|"tool_use"| tools
-  end
+### 图例索引
 
-  subgraph L1["Layer 1 上下文壳"]
-    prep["1a prep"]
-    finish["1b finish"]
-    prep --> llm
-    finish -->|"recovery"| prep
-  end
-
-  subgraph L2["Layer 2 编排壳"]
-    attach["2b attachments"]
-    hooks["2c hooks"]
-    wrap["2e wrapper"]
-    tools --> attach
-    attach --> prep
-    llm -->|"无 tool"| finish
-    finish --> hooks
-    hooks -->|"completed"| END_NODE((END))
-    hooks -->|"continue"| prep
-  end
-
-  START((用户)) --> wrap
-  wrap --> prep
-```
+| 图 | 内容 |
+|----|------|
+| **图 1** | 三层职责（静态） |
+| **图 2** | **主循环**（全文总图） |
+| **图 3** | Layer 0 内核 ReAct |
+| **图 4** | 1-1 prep 管线 |
+| **图 5** | 1-2 finish / recovery |
+| **图 6** | 2-1 tools 执行方式 |
+| **图 7** | 2-2 attachments |
+| **图 8** | 2-3 hooks / budget |
+| **图 9** | 2-4 abort（表） |
+| **图 10** | 2-5 query() 包装 |
 
 ### 一章一表
 
@@ -449,25 +500,19 @@ flowchart TB
 ### 单次用户消息的生命周期
 
 1. **REPL** → `query(messages, …)`（见 [startup-to-query-walkthrough](./startup-to-query-walkthrough.md)）。
-2. **Layer 2e**：`query()` 建 trace，进入 `queryLoop`。
-3. **Layer 1a prep**：压 messages，可能 yield compact。
+2. **Layer 2-5**：`query()` 建 trace，进入 `queryLoop`。
+3. **Layer 1-1 prep**：压 messages，可能 yield compact。
 4. **Layer 0 llm**：流式；有 `tool_use` → `needsFollowUp`。
-5. **若无 tool**：**Layer 1b finish**（recovery）→ **Layer 2c hooks** → `completed` 或 continue。
-6. **若有 tool**：**Layer 2a tools** → **Layer 2b attachments** → `next_turn`。
+5. **若无 tool**：**Layer 1-2 finish**（recovery）→ **Layer 2-3 hooks** → `completed` 或 continue。
+6. **若有 tool**：**Layer 2-1 tools** → **Layer 2-2 attachments** → `next_turn`。
 7. 回到步骤 3，直到 **Terminal** / **maxTurns**。
-8. **Layer 2e finally**：autonomy、flush trace → 返回 REPL。
+8. **Layer 2-5 finally**：autonomy、flush trace → 返回 REPL。
 
 ### 和「复杂图」的关系
 
-若把 snip、reactive compact、stop_hook_blocking 各拆成 LangGraph 节点，会得到 15+ 节点——那是 **实现展开图**，不是 **架构图**。
+若把 snip、reactive compact、stop_hook_blocking 各拆成 LangGraph 节点，会得到 15+ 节点——那是 **实现展开图**。
 
-**架构图永远只有**：
-
-```
-prep → llm ─┬─→ finish → (hooks) → END
-            └─→ tools → attachments ─┘
-                    ↑__________________|
-```
+**架构 / 教学只保留图 2**。图 3–10 是 **局部放大**，不要各自再画一整圈环。
 
 ---
 
