@@ -293,6 +293,7 @@ flowchart LR
 |------|------|
 | `runTools` / `StreamingToolExecutor` | 权限、执行、yield tool_result；可与 llm 并行 |
 | fallback / `discard()` | 换模型重试时清 orphan tool_result |
+| tool error → feedback | `is_error`、分层校验、synthetic result、loop 继续；详见 [tool-error-as-feedback.md](./tool-error-as-feedback.md) |
 
 `StreamingToolExecutor` **不改变图**——仍是 `llm → tools`，只重叠时间。
 
@@ -694,3 +695,4 @@ export type Continue =
 - 官方：[Agentic Loop](../../docs/conversation/the-loop.mdx)
 - 本仓库架构白皮书：[architecture-overview.mdx](../../docs/introduction/architecture-overview.mdx)
 - 启动链笔记：[startup-to-query-walkthrough.md](./startup-to-query-walkthrough.md)
+- Tool error 作为 feedback：[tool-error-as-feedback.md](./tool-error-as-feedback.md)
